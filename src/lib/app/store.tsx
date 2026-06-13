@@ -128,15 +128,30 @@ function save(key: string, v: unknown) {
   }
 }
 
-const j = (v: number, span: number, lo: number, hi: number) =>
-  Math.max(lo, Math.min(hi, +(v + (Math.random() - 0.5) * span).toFixed(2)));
+// Deterministic sine-wave oscillation — no Math.random(), values follow device settings.
+// tick increments each interval so the wave moves forward in time.
+const smooth = (
+  prev: number,
+  target: number,
+  amplitude: number,
+  lo: number,
+  hi: number,
+  phase: number,
+  tick: number,
+) => {
+  const wave = Math.sin(tick * 0.18 + phase) * amplitude * 0.45;
+  const v = prev * 0.88 + (target + wave) * 0.12;
+  return Math.max(lo, Math.min(hi, +v.toFixed(2)));
+};
 
 // Generates per-line readings driven by simulator device parameters.
 // When a simulator device is offline its sensor contribution drops to 0.
+// tick is the global simulation step counter — passed in so oscillations are deterministic.
 function genReadingFromSim(
   lineIds: string[],
   devices: Device[],
   prev: Record<string, SensorReading>,
+  tick: number = 0,
 ): Record<string, SensorReading> {
   const tempSim = devices.find((d) => d.isSimulator && d.type === "Harorat sensori");
   const energySim = devices.find((d) => d.isSimulator && d.type === "Energiya hisoblagich");
@@ -144,22 +159,37 @@ function genReadingFromSim(
   const tempOnline = !tempSim || tempSim.status === "online";
   const energyOnline = !energySim || energySim.status === "online";
 
+  const tV = tempSim?.simValue ?? 65;
+  const tJ = tempSim?.simJitter ?? 3;
+  const tMin = tempSim?.simMin ?? 25;
+  const tMax = tempSim?.simMax ?? 95;
+
+  const eV = energySim?.simValue ?? 450;
+  const eJ = energySim?.simJitter ?? 40;
+  const eMin = energySim?.simMin ?? 100;
+  const eMax = energySim?.simMax ?? 900;
+
   const next: Record<string, SensorReading> = {};
   for (const lineId of lineIds) {
     const p = prev[lineId];
+    const energy = energyOnline
+      ? smooth(p?.energy ?? eV, eV, eJ, eMin, eMax, 1.1, tick)
+      : 0;
+    // Productivity scales with energy device's output level (not random)
+    const prodBase = energyOnline ? 50 + ((eV - eMin) / Math.max(1, eMax - eMin)) * 45 : 0;
     next[lineId] = {
       temperature: tempOnline
-        ? j(p?.temperature ?? (tempSim?.simValue ?? 65), tempSim?.simJitter ?? 3, tempSim?.simMin ?? 25, tempSim?.simMax ?? 95)
+        ? smooth(p?.temperature ?? tV, tV, tJ, tMin, tMax, 0, tick)
         : 0,
-      humidity: j(p?.humidity ?? 55, 3, 30, 80),
-      vibration: j(p?.vibration ?? 2.5, 1.2, 0.2, 9),
-      energy: energyOnline
-        ? j(p?.energy ?? (energySim?.simValue ?? 450), energySim?.simJitter ?? 40, energySim?.simMin ?? 100, energySim?.simMax ?? 900)
+      humidity:    smooth(p?.humidity    ?? 55,  55,  1.2, 30,  80,  2.1, tick),
+      vibration:   smooth(p?.vibration   ?? 2.5, 2.5, 0.3, 0.2, 9,   3.3, tick),
+      energy,
+      pressure:    smooth(p?.pressure    ?? 5,   5,   0.2, 1,   12,  4.5, tick),
+      current:     energyOnline ? smooth(p?.current ?? 50, energy * 0.11, 1.5, 5, 120, 1.8, tick) : 0,
+      voltage:     smooth(p?.voltage     ?? 390, 390, 1.2, 360, 420, 0.3, tick),
+      productivity: energyOnline
+        ? smooth(p?.productivity ?? prodBase, prodBase, 1.5, 50, 99, 0.7, tick)
         : 0,
-      pressure: j(p?.pressure ?? 5, 1, 1, 12),
-      current: energyOnline ? j(p?.current ?? 50, 8, 5, 120) : 0,
-      voltage: j(p?.voltage ?? 390, 4, 360, 420),
-      productivity: energyOnline ? j(p?.productivity ?? 82, 3, 50, 99) : 0,
     };
   }
   return next;
@@ -184,8 +214,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
     pressure: 10,
   });
   const [updateInterval, setUpdateIntervalState] = useState<number>(3500);
+  const tickRef = useRef(0);
+  // Cooldown map: key = "lineId-metric", value = last alert timestamp (ms)
+  const alertCooldownRef = useRef<Map<string, number>>(new Map());
+
   const [readings, setReadings] = useState<Record<string, SensorReading>>(() =>
-    genReadingFromSim(seedLines.map((l) => l.id), seedDevices, {}),
+    genReadingFromSim(seedLines.map((l) => l.id), seedDevices, {}, 0),
   );
   const [history, setHistory] = useState<AppCtx["history"]>(() => {
     const lineIds = seedLines.map((l) => l.id);
@@ -193,7 +227,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     const base = Date.now() - 20 * 60_000;
     let prevR: Record<string, SensorReading> = {};
     for (let i = 0; i < 20; i++) {
-      prevR = genReadingFromSim(lineIds, seedDevices, prevR);
+      prevR = genReadingFromSim(lineIds, seedDevices, prevR, i);
       const n = lineIds.length || 1;
       arr.push({
         t: new Date(base + i * 60_000).toLocaleTimeString("uz-UZ", { hour: "2-digit", minute: "2-digit" }),
@@ -244,18 +278,20 @@ export function AppProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (prevDevicesRef.current === devices) return;
     prevDevicesRef.current = devices;
-    setReadings((prev) => genReadingFromSim(lines.map((l) => l.id), devices, prev));
+    setReadings((prev) => genReadingFromSim(lines.map((l) => l.id), devices, prev, tickRef.current));
   }, [devices, lines]);
 
-  // Realtime simulation: readings driven by simulator device parameters
+  // Realtime simulation: readings driven by simulator device parameters, no Math.random()
   useEffect(() => {
     const lineIds = lines.map((l) => l.id);
+    const COOLDOWN_MS = 30_000; // one alert per metric per line every 30 s
     const id = window.setInterval(() => {
+      tickRef.current += 1;
+      const tick = tickRef.current;
       setReadings((prev) => {
-        const next = genReadingFromSim(lineIds, devices, prev);
+        const next = genReadingFromSim(lineIds, devices, prev, tick);
         const n = lineIds.length || 1;
 
-        // History entry from actual readings (not random)
         const avgT = lineIds.reduce((s, lid) => s + (next[lid]?.temperature ?? 0), 0) / n;
         const avgE = lineIds.reduce((s, lid) => s + (next[lid]?.energy ?? 0), 0) / n;
         const avgP = lineIds.reduce((s, lid) => s + (next[lid]?.productivity ?? 0), 0) / n;
@@ -271,64 +307,55 @@ export function AppProvider({ children }: { children: ReactNode }) {
           },
         ]);
 
-        // Alerts only when actual readings exceed thresholds (not randomly)
+        // Alerts fire deterministically when threshold exceeded, with 30 s cooldown (no Math.random)
+        const now = Date.now();
+        const cd = alertCooldownRef.current;
         for (const l of lines) {
           const r = next[l.id];
           if (!r) continue;
-          if (r.temperature > 0 && r.temperature > thresholds.temperature && Math.random() < 0.15) {
+
+          const tempKey = `${l.id}-temp`;
+          if (r.temperature > 0 && r.temperature > thresholds.temperature && now - (cd.get(tempKey) ?? 0) > COOLDOWN_MS) {
+            cd.set(tempKey, now);
             const lvl: AlertItem["level"] = r.temperature > thresholds.temperature + 6 ? "Kritik" : "Yuqori";
             const newAlert: AlertItem = {
-              id: `a-${Date.now()}t`,
+              id: `a-${now}t`,
               title: "Harorat me'yordan oshdi",
               message: `${l.name} da harorat ${r.temperature.toFixed(1)}°C ga yetdi`,
-              level: lvl,
-              status: "Yangi",
-              source: "Harorat Simulyatori",
-              lineId: l.id,
-              deviceId: "sim-001",
-              createdAt: new Date().toISOString(),
+              level: lvl, status: "Yangi", source: "Harorat Simulyatori",
+              lineId: l.id, deviceId: "sim-001", createdAt: new Date().toISOString(),
             };
             setAlerts((a) => [newAlert, ...a].slice(0, 60));
-            toast[lvl === "Kritik" ? "error" : "warning"](newAlert.title, {
-              description: newAlert.message,
-              duration: 6000,
-            });
+            toast[lvl === "Kritik" ? "error" : "warning"](newAlert.title, { description: newAlert.message, duration: 6000 });
           }
-          if (r.energy > 0 && r.energy > thresholds.energy && Math.random() < 0.1) {
+
+          const energyKey = `${l.id}-energy`;
+          if (r.energy > 0 && r.energy > thresholds.energy && now - (cd.get(energyKey) ?? 0) > COOLDOWN_MS) {
+            cd.set(energyKey, now);
             const newAlert: AlertItem = {
-              id: `a-${Date.now()}e`,
+              id: `a-${now}e`,
               title: "Energiya sarfi me'yordan oshdi",
               message: `${l.name} da energiya ${r.energy.toFixed(0)} kWh ga yetdi`,
-              level: "Yuqori",
-              status: "Yangi",
-              source: "Energiya Simulyatori",
-              lineId: l.id,
-              deviceId: "sim-002",
-              createdAt: new Date().toISOString(),
+              level: "Yuqori", status: "Yangi", source: "Energiya Simulyatori",
+              lineId: l.id, deviceId: "sim-002", createdAt: new Date().toISOString(),
             };
             setAlerts((a) => [newAlert, ...a].slice(0, 60));
-            toast.warning(newAlert.title, {
-              description: newAlert.message,
-              duration: 6000,
-            });
+            toast.warning(newAlert.title, { description: newAlert.message, duration: 6000 });
           }
-          if (r.vibration > thresholds.vibration && Math.random() < 0.1) {
+
+          const vibKey = `${l.id}-vib`;
+          if (r.vibration > thresholds.vibration && now - (cd.get(vibKey) ?? 0) > COOLDOWN_MS) {
+            cd.set(vibKey, now);
             const lvl: AlertItem["level"] = r.vibration > thresholds.vibration + 2 ? "Kritik" : "Yuqori";
             const newAlert: AlertItem = {
-              id: `a-${Date.now()}v`,
+              id: `a-${now}v`,
               title: "Vibratsiya me'yordan oshdi",
               message: `${l.name} da vibratsiya ${r.vibration.toFixed(2)} mm/s ga yetdi`,
-              level: lvl,
-              status: "Yangi",
-              source: "Real-time tahlilchi",
-              lineId: l.id,
-              createdAt: new Date().toISOString(),
+              level: lvl, status: "Yangi", source: "Real-time tahlilchi",
+              lineId: l.id, createdAt: new Date().toISOString(),
             };
             setAlerts((a) => [newAlert, ...a].slice(0, 60));
-            toast[lvl === "Kritik" ? "error" : "warning"](newAlert.title, {
-              description: newAlert.message,
-              duration: 6000,
-            });
+            toast[lvl === "Kritik" ? "error" : "warning"](newAlert.title, { description: newAlert.message, duration: 6000 });
           }
         }
         return next;
