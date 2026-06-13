@@ -8,6 +8,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { toast } from "sonner";
 import {
   alerts as seedAlerts,
   devices as seedDevices,
@@ -288,6 +289,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
               createdAt: new Date().toISOString(),
             };
             setAlerts((a) => [newAlert, ...a].slice(0, 60));
+            toast[lvl === "Kritik" ? "error" : "warning"](newAlert.title, {
+              description: newAlert.message,
+              duration: 6000,
+            });
           }
           if (r.energy > 0 && r.energy > thresholds.energy && Math.random() < 0.1) {
             const newAlert: AlertItem = {
@@ -302,6 +307,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
               createdAt: new Date().toISOString(),
             };
             setAlerts((a) => [newAlert, ...a].slice(0, 60));
+            toast.warning(newAlert.title, {
+              description: newAlert.message,
+              duration: 6000,
+            });
           }
           if (r.vibration > thresholds.vibration && Math.random() < 0.1) {
             const lvl: AlertItem["level"] = r.vibration > thresholds.vibration + 2 ? "Kritik" : "Yuqori";
@@ -316,6 +325,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
               createdAt: new Date().toISOString(),
             };
             setAlerts((a) => [newAlert, ...a].slice(0, 60));
+            toast[lvl === "Kritik" ? "error" : "warning"](newAlert.title, {
+              description: newAlert.message,
+              duration: 6000,
+            });
           }
         }
         return next;
