@@ -12,4 +12,15 @@ export default defineConfig({
   tanstackStart: {
     server: { entry: "server" },
   },
+  // Enable Nitro with Vercel preset so `npm run build` outputs to .vercel/output/
+  // (Vercel Build Output API). Without this, Nitro is skipped outside Lovable sandbox
+  // and Vercel deploys dist/client/ as a static site with no index.html → 404 on every route.
+  nitro: {
+    preset: "vercel",
+    output: {
+      dir: ".vercel/output",
+      serverDir: ".vercel/output/server",
+      publicDir: ".vercel/output/static",
+    },
+  },
 });
